@@ -1,0 +1,262 @@
+# Standalone example Blueprint for the SUSE AI Factory operator.
+#
+# This is NOT bundled with the aif-operator chart; apply it manually with
+# `kubectl apply -f` on the cluster where Rancher runs (the local/management
+# cluster).
+#
+# It deploys the SUSE Rancher AI Assistant ("Liz") end-to-end:
+#   - Ollama, preloaded with the gpt-oss:20b tool-calling model
+#   - the rancher-ai-agent (Liz agent) chart
+#   - the rancher-ai-ui (Liz UI extension) chart
+#
+# Inference runs on GPU using gpt-oss:20b (requires an NVIDIA GPU). See the
+# prerequisites and notes in spec.description below before applying. For a
+# CPU-only variant use rancher-ai-assistant-with-ollama-1.0.0.yaml instead.
+apiVersion: ai-factory.suse.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: rancher-ai-assistant-with-ollama-gpu-1-0-0
+  labels:
+    ai-factory.suse.com/blueprint-name: rancher-ai-assistant-with-ollama-gpu
+    ai-factory.suse.com/blueprint-version: 1.0.0
+spec:
+  displayName: Rancher AI Assistant with Ollama (GPU)
+  version: 1.0.0
+  source: SUSE
+  description: |-
+    Deploys the SUSE Rancher AI Assistant ("Liz"): the rancher-ai-agent chart, the
+    rancher-ai-ui extension, and an Ollama instance preloaded with the gpt-oss:20b
+    tool-calling model (GPU inference). Install on the cluster where Rancher runs.
+
+    WORKLOAD NAMESPACE: set the AIWorkload targetNamespace to
+    `cattle-ai-agent-system`. Each component also pins its own namespace, so
+    Ollama and the Liz agent land in `cattle-ai-agent-system` and the UI
+    extension in `cattle-ui-plugin-system` regardless of the workload value;
+    matching the workload to `cattle-ai-agent-system` keeps everything aligned.
+
+    PREREQUISITES:
+    - Rancher Prime/Community Manager 2.13+, cluster-admin (Liz installs CRDs),
+      Kubernetes >=1.31.4 <1.35, Rancher UI-extensions >=3.0.0 <4.0.0.
+    - An NVIDIA GPU node with the NVIDIA GPU Operator (or device plugin) so that
+      `nvidia.com/gpu` is schedulable. If your cluster requires a RuntimeClass to
+      access the GPU, set `runtimeClassName` in the ollama values (e.g. "nvidia").
+    - A default StorageClass (Ollama persists the pulled model).
+    - The `application-collection` ClusterRepo and its credentials (standard AI
+      Factory Settings) for the Ollama chart.
+    - Create the two ClusterRepos shown below before applying this Blueprint.
+      NOTE: do not reuse the built-in `rancher-ui-plugins` name (Rancher's git
+      repo); this uses a distinct name.
+    - IMPORTANT: `liz-charts-obs` points at an UNOFFICIAL, community-rebuilt
+      mirror of the Liz agent chart (rancher-ai-agent) re-tagged with a clean
+      semver (1.0.2). It exists solely to work around
+      https://github.com/rancher/fleet/issues/5410 -- Fleet's HelmOp cannot
+      resolve the official Prime OCI tag 109.0.1_up1.0.2. It is NOT the
+      SUSE-supported artifact; for production install the Prime chart from
+      oci://registry.suse.com/rancher/charts out-of-band, or wait for the Fleet
+      fix. Repoint `liz-charts-obs` at your own mirror as needed.
+
+    ClusterRepos to create (copy-paste ready):
+
+    apiVersion: catalog.cattle.io/v1
+    kind: ClusterRepo
+    metadata:
+      name: liz-charts-obs
+    spec:
+      url: oci://registry.opensuse.org/home/eminguez/charts/images
+    ---
+    apiVersion: catalog.cattle.io/v1
+    kind: ClusterRepo
+    metadata:
+      name: rancher-ui-plugins-http
+    spec:
+      url: https://raw.githubusercontent.com/rancher/ui-plugin-charts/4.31.0
+
+    NOTES:
+    - First start pulls ~13 GB (gpt-oss:20b) and may take several minutes. Liz init
+      fails until the model exists; it retries, or run:
+      kubectl rollout restart deployment rancher-ai-agent -n cattle-ai-agent-system
+    - EXPECTED first-boot behavior: the ollama chart pulls (and, via models.run,
+      loads) the model in a container postStart hook. While it runs, the pod stays
+      0/1 Ready and `kubectl logs` returns
+      "BadRequest ... waiting to start: ContainerCreating" even though a "Started"
+      event already fired. This is NOT an error. Watch progress with:
+      kubectl exec -n cattle-ai-agent-system <ollama-pod> -c ollama -- \
+        sh -c 'ollama list; du -sh /root/.ollama'
+      /root/.ollama grows toward ~13 GB; when `ollama list` shows gpt-oss:20b the
+      pod flips to 1/1. The model is persisted to the PVC, so restarts are fast.
+    - VRAM: gpt-oss:20b needs ~13-14 GiB to load. Use a GPU with >=16 GB VRAM
+      (e.g. A10/L4/24 GB). If VRAM is insufficient the ollama logs show a
+      "model requires more ... memory than is available" error and /api/generate
+      returns 500 (the pull succeeds but the load fails).
+    - The UI extension chart is served from ui-plugin-charts consumed as an HTTP Helm
+      repo. If the HelmOp cannot pull from raw.githubusercontent.com, install
+      rancher-ai-ui out-of-band instead (git ClusterRepo rancher-ui-plugins +
+      UIPlugin, or via Rancher -> Extensions).
+  components:
+  - chartName: ollama
+    chartRepo: application-collection
+    chartVersion: 1.55.0
+    targetNamespace: cattle-ai-agent-system
+    values:
+      affinity: {}
+      autoscaling:
+        enabled: false
+        maxReplicas: 100
+        minReplicas: 1
+        targetCPUUtilizationPercentage: 80
+      deployment:
+        labels: {}
+      extraArgs: []
+      extraEnv: []
+      extraEnvFrom: []
+      extraObjects: []
+      # Pin the service name so cross-component URLs don't depend on the Helm
+      # release name (the operator derives it from the chart name). The Liz agent
+      # reaches this as http://ollama:11434 (namespace-relative short name).
+      fullnameOverride: ollama
+      global:
+        imagePullSecrets: []
+        imageRegistry: ""
+      hostIPC: false
+      hostNetwork: false
+      hostPID: false
+      image:
+        pullPolicy: IfNotPresent
+        registry: dp.apps.rancher.io
+        repository: containers/ollama
+        tag: 0.21.2-11.48
+      imagePullSecrets: []
+      ingress:
+        annotations: {}
+        className: ""
+        enabled: false
+        hosts:
+        - host: ollama.local
+          paths:
+          - path: /
+            pathType: Prefix
+        tls: []
+      initContainers: []
+      knative:
+        annotations: {}
+        containerConcurrency: 0
+        enabled: false
+        idleTimeoutSeconds: 300
+        modelBootstrap:
+          ttlSecondsAfterFinished: 300
+        responseStartTimeoutSeconds: 300
+        timeoutSeconds: 300
+      lifecycle: {}
+      livenessProbe:
+        enabled: true
+        failureThreshold: 30
+        initialDelaySeconds: 120
+        path: /
+        periodSeconds: 10
+        successThreshold: 1
+        timeoutSeconds: 5
+      nameOverride: ""
+      namespaceOverride: ""
+      nodeSelector: {}
+      ollama:
+        gpu:
+          draDriverClass: gpu.nvidia.com
+          draEnabled: false
+          draExistingClaimTemplate: ""
+          # GPU inference enabled: the chart requests nvidia.com/gpu for the pod.
+          enabled: true
+          mig:
+            devices: {}
+            enabled: false
+          number: 1
+          nvidiaResource: nvidia.com/gpu
+          type: nvidia
+        insecure: false
+        models:
+          clean: false
+          create: []
+          pull:
+          - gpt-oss:20b
+          run:
+          - gpt-oss:20b
+        mountPath: ""
+        port: 11434
+      persistentVolume:
+        accessModes:
+        - ReadWriteOnce
+        annotations: {}
+        enabled: true
+        existingClaim: ""
+        size: 30Gi
+        storageClass: ""
+        subPath: ""
+        volumeMode: ""
+        volumeName: ""
+      podAnnotations: {}
+      podLabels: {}
+      podSchedulerName: ""
+      podSecurityContext: {}
+      priorityClassName: ""
+      readinessProbe:
+        enabled: true
+        failureThreshold: 30
+        initialDelaySeconds: 60
+        path: /
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 3
+      replicaCount: 1
+      resources:
+        limits: {}
+        requests: {}
+      # Set to "nvidia" if your cluster requires a RuntimeClass to access GPUs.
+      runtimeClassName: ""
+      securityContext: {}
+      service:
+        annotations: {}
+        ipFamilies: []
+        ipFamilyPolicy: ""
+        labels: {}
+        loadBalancerIP: null
+        nodePort: 31434
+        port: 11434
+        type: ClusterIP
+      serviceAccount:
+        annotations: {}
+        automount: true
+        create: true
+        name: ""
+      terminationGracePeriodSeconds: 120
+      tests:
+        annotations: {}
+        enabled: true
+        labels: {}
+      tolerations: []
+      topologySpreadConstraints: {}
+      updateStrategy:
+        type: Recreate
+      volumeMounts: []
+      volumes: []
+  # Liz agent: the rancher-ai-agent chart. It runs the assistant backend and
+  # talks to Ollama over the OpenAI-compatible/Ollama API.
+  # Pulled from liz-charts-obs, an UNOFFICIAL community mirror that re-tags the
+  # Liz agent chart with a clean semver (v1.0.2). This works around
+  # https://github.com/rancher/fleet/issues/5410: the official Prime chart is
+  # only at oci://registry.suse.com/rancher/charts with tag 109.0.1_up1.0.2,
+  # which Fleet's HelmOp OCI resolver cannot parse. NOT SUSE-supported; for
+  # production install the Prime chart out-of-band. See spec.description.
+  - chartName: rancher-ai-agent
+    chartRepo: liz-charts-obs
+    chartVersion: "v1.0.2"
+    targetNamespace: cattle-ai-agent-system
+    values:
+      activeLlm: "ollama"
+      ollamaUrl: "http://ollama:11434"
+      ollamaLlmModel: "gpt-oss:20b"
+  # Liz UI extension: the rancher-ai-ui chart, which creates the UIPlugin CR
+  # that surfaces the assistant inside the Rancher UI.
+  - chartName: rancher-ai-ui
+    chartRepo: rancher-ui-plugins-http
+    chartVersion: "1.0.1"
+    targetNamespace: cattle-ui-plugin-system
+    values: {}
